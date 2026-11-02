@@ -2,6 +2,8 @@
 
 The `review/` Action requests a bomoon-bot App review and waits for its check. It needs no checkout and never executes pull request code. Install the App on the repository first. App installation authorizes access; your workflow chooses when to request a review.
 
+For the separate owner-decision gate, see the [Review-policy Action](review-policy-action.md). It uses a different endpoint/audience and requires exact `success`; the `review/` behavior documented here is unchanged.
+
 ## Workflow
 
 Use `@main` to track the latest merged Action. The workflow becomes available after `review/` is merged to `main` and the compatible service is deployed. Set the repository variable `BOMOON_REVIEW_SERVICE_URL` to your **trusted HTTPS service origin**. There is no default service URL.

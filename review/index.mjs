@@ -2,6 +2,8 @@ import { appendFile, readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 const AUDIENCE = 'bomoon-bot:review';
+const POLICY_AUDIENCE = 'bomoon-bot:review-policy';
+const policyCommand = body => typeof body === 'string' && /^\/review-policy(?:\s|$)/.test(body);
 const SHA = /^[0-9a-f]{40}$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const positive = value => Number.isSafeInteger(value) && value > 0;
@@ -31,13 +33,16 @@ function secret(value) {
 }
 
 // All failures use controlled messages: fetch/JSON exceptions may contain credentials or URLs.
-export async function run({ env = process.env, fetch: fetchFn = globalThis.fetch,
+export const run = options => runTransport(options, false);
+export const runReviewPolicy = options => runTransport(options, true);
+
+async function runTransport({ env = process.env, fetch: fetchFn = globalThis.fetch,
   read = readFile, output = async values => {
     if (!env.GITHUB_OUTPUT) fail('GitHub output file is unavailable.');
     await appendFile(env.GITHUB_OUTPUT, Object.entries(values).map(([k, v]) => `${k}=${v}\n`).join(''));
   }, mask = value => console.log(`::add-mask::${value.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A')}`),
   now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
-  deadlineMs = 25 * 60 * 1000, requestTimeoutMs = 15000, pollMs = 10000 } = {}) {
+  deadlineMs = 25 * 60 * 1000, requestTimeoutMs = 15000, pollMs = 10000 } = {}, policy) {
   const deadline = now() + deadlineMs;
   const remaining = () => {
     const ms = deadline - now();
@@ -77,25 +82,55 @@ export async function run({ env = process.env, fetch: fetchFn = globalThis.fetch
     fail(`${label} failed after bounded retries.`);
   }
 
-  if (env.GITHUB_EVENT_NAME !== 'pull_request') fail('Only pull_request events are supported.');
+  const commentEvent = policy && env.GITHUB_EVENT_NAME === 'issue_comment';
+  if (env.GITHUB_EVENT_NAME !== 'pull_request' && !commentEvent) {
+    fail(policy ? 'Only pull_request and issue_comment events are supported.' : 'Only pull_request events are supported.');
+  }
   let event;
   try { event = JSON.parse(await read(env.GITHUB_EVENT_PATH, 'utf8')); }
   catch { fail('Cannot read GitHub pull request event.'); }
-  const pr = event?.number;
-  const head = event?.pull_request?.head?.sha;
+  const pr = commentEvent ? event?.issue?.number : event?.number;
+  let head = commentEvent ? undefined : event?.pull_request?.head?.sha;
   const repo = env.GITHUB_REPOSITORY;
-  if (!positive(pr) || !SHA.test(head ?? '') || !REPOSITORY.test(repo ?? '') ||
-      event?.repository?.full_name !== repo || event?.pull_request?.number !== pr ||
-      event?.pull_request?.base?.repo?.full_name !== repo) fail('Invalid GitHub pull request context.');
-  if (event.pull_request.state !== 'open') fail('Pull request is not open.');
-  if (event.pull_request.draft === true) {
-    await output({ conclusion: 'skipped', 'check-url': '', 'head-sha': head });
-    return { conclusion: 'skipped', exitCode: 0 };
+  if (!positive(pr) || !REPOSITORY.test(repo ?? '') || event?.repository?.full_name !== repo) {
+    fail('Invalid GitHub pull request context.');
+  }
+  if (commentEvent) {
+    // Re-evaluate withdrawn commands too, including edits/deletions with no body.
+    // Payload identity is never authority; the service validates the OIDC actor
+    // and reads current comments/permissions. The workflow also filters relevance.
+    if (!event?.issue?.pull_request || !positive(event?.comment?.id) ||
+        !['created', 'edited', 'deleted'].includes(event.action) ||
+        (event.action === 'created' && !policyCommand(event.comment.body))) {
+      fail('Invalid or irrelevant review-policy comment event.');
+    }
+  } else {
+    if (!SHA.test(head ?? '') || event?.pull_request?.number !== pr ||
+        event?.pull_request?.base?.repo?.full_name !== repo) fail('Invalid GitHub pull request context.');
+    if (event.pull_request.state !== 'open') fail('Pull request is not open.');
+    if (event.pull_request.draft === true) {
+      if (policy) fail('Review policy requires an open, non-draft pull request.');
+      await output({ conclusion: 'skipped', 'check-url': '', 'head-sha': head });
+      return { conclusion: 'skipped', exitCode: 0 };
+    }
   }
   const origin = serviceOrigin(env['INPUT_SERVICE-URL']);
   const githubToken = env['INPUT_GITHUB-TOKEN'];
   if (!secret(githubToken)) fail('github-token is required.');
   mask(githubToken);
+  // This fixed origin is the only destination that ever receives github-token.
+  const api = `https://api.github.com/repos/${repo.split('/').map(encodeURIComponent).join('/')}`;
+  const headers = { Authorization: `Bearer ${githubToken}`, Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'bomoon-bot-review-action' };
+  const expectedRepository = current => current?.number === pr && current?.base?.repo?.full_name === repo;
+  if (policy) {
+    const { data: current } = await request(`${api}/pulls/${pr}`, { headers }, 'GitHub pull request read');
+    if (!expectedRepository(current) || !SHA.test(current?.head?.sha ?? '') ||
+        current?.state !== 'open' || current?.draft !== false || (!commentEvent && current.head.sha !== head)) {
+      fail('Pull request changed or has invalid repository, head, or open/non-draft context.');
+    }
+    head = current.head.sha;
+  }
   if (!secret(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) || !env.ACTIONS_ID_TOKEN_REQUEST_URL) {
     fail('GitHub OIDC is unavailable; grant id-token: write. Fork OIDC is not supported.');
   }
@@ -106,13 +141,13 @@ export async function run({ env = process.env, fetch: fetchFn = globalThis.fetch
   if (oidcUrl.protocol !== 'https:' || oidcUrl.username || oidcUrl.password || oidcUrl.hash) {
     fail('Invalid GitHub OIDC request URL.');
   }
-  oidcUrl.searchParams.set('audience', AUDIENCE);
+  oidcUrl.searchParams.set('audience', policy ? POLICY_AUDIENCE : AUDIENCE);
   const { data: oidc } = await request(oidcUrl.href, {
     headers: { Authorization: `Bearer ${env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
   }, 'GitHub OIDC request');
   if (!secret(oidc?.value)) fail('GitHub OIDC returned an invalid token.');
   mask(oidc.value);
-  const { data: accepted, status } = await request(`${origin}/github/review`, {
+  const { data: accepted, status } = await request(`${origin}/github/${policy ? 'review-policy' : 'review'}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${oidc.value}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ pr, head_sha: head }),
@@ -122,10 +157,6 @@ export async function run({ env = process.env, fetch: fetchFn = globalThis.fetch
       !positive(accepted.check_id) || !positive(accepted.app_id) || accepted.head_sha !== head ||
       !githubCheckUrl(accepted.check_url)) fail('Review service returned an invalid response.');
 
-  // This fixed origin is the only destination that ever receives github-token.
-  const api = `https://api.github.com/repos/${repo.split('/').map(encodeURIComponent).join('/')}`;
-  const headers = { Authorization: `Bearer ${githubToken}`, Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'bomoon-bot-review-action' };
   for (;;) {
     remaining();
     const { data: check } = await request(`${api}/check-runs/${accepted.check_id}`, { headers }, 'GitHub check read');
@@ -137,11 +168,13 @@ export async function run({ env = process.env, fetch: fetchFn = globalThis.fetch
         fail('GitHub check has an invalid terminal conclusion.');
       }
       const { data: current } = await request(`${api}/pulls/${pr}`, { headers }, 'GitHub pull request read');
-      if (current?.head?.sha !== head || current?.state !== 'open' || current?.draft !== false) {
+      if (current?.head?.sha !== head || current?.state !== 'open' || current?.draft !== false ||
+          (policy && !expectedRepository(current))) {
         fail('Pull request changed, closed, or became draft; this review is stale.');
       }
       await output({ conclusion: check.conclusion, 'check-url': accepted.check_url, 'head-sha': head });
-      return { conclusion: check.conclusion, exitCode: ['success', 'neutral'].includes(check.conclusion) ? 0 : 1 };
+      const passed = policy ? check.conclusion === 'success' : ['success', 'neutral'].includes(check.conclusion);
+      return { conclusion: check.conclusion, exitCode: passed ? 0 : 1 };
     }
     if (!['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(check.status)) {
       fail('GitHub check returned an invalid status.');

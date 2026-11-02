@@ -1,0 +1,19 @@
+name: bomoon-bot review policy
+description: Request the App's owner-decision policy check without checking out or running PR code.
+inputs:
+  service-url:
+    description: Trusted HTTPS origin of the review service (no path, query, or fragment).
+    required: true
+  github-token:
+    description: Token used only to read checks and pull requests at api.github.com.
+    default: ${{ github.token }}
+outputs:
+  conclusion:
+    description: Exact App check conclusion. Only success passes.
+  check-url:
+    description: GitHub URL of the App check.
+  head-sha:
+    description: Pull request head SHA evaluated.
+runs:
+  using: node24
+  main: index.mjs
