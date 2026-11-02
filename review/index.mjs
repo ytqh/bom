@@ -97,7 +97,7 @@ async function runTransport({ env = process.env, fetch: fetchFn = globalThis.fet
   }
   if (commentEvent) {
     // Re-evaluate withdrawn commands too, including edits/deletions with no body.
-    // Payload identity is never authority; the service validates the OIDC actor
+    // Payload identity is never authority; the service validates the signed workflow
     // and reads current comments/permissions. The workflow also filters relevance.
     if (!event?.issue?.pull_request || !positive(event?.comment?.id) ||
         !['created', 'edited', 'deleted'].includes(event.action) ||

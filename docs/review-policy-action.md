@@ -51,7 +51,7 @@ Use a top-level PR comment, with a full **40-character lowercase head SHA** and 
 /review-policy revoke aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Previous decision withdrawn because ...
 ```
 
-The service, not this Action or the payload's author fields, verifies that the OIDC actor is currently a human repository admin. PR authors who are admins can resolve an owner decision this way; the command is not a GitHub code-review approval. Bots, non-admins, quoted commands, partial SHAs, and commands for other heads cannot grant approval.
+The service, not this Action or the payload's author fields, verifies that the approval command's author is currently a human repository admin. A signed default-branch workflow can request re-evaluation even after its actor loses admin access, so withdrawal is not lost; triggering the workflow grants no approval. PR authors who are admins can resolve an owner decision this way; the command is not a GitHub code-review approval. Bots, non-admins, quoted commands, partial SHAs, and commands for other heads cannot grant approval.
 
 The service reads trusted policy from `.github/review-policy.md` on the default branch and evaluates the exact PR head. Owner resolution applies only to a valid escalation; it cannot excuse missing policy, invalid judgment, or infrastructure errors. The service must re-read live comments and permissions before finalizing. Editing/deleting a command or moving the head must invalidate withdrawn/stale approval; conflicting admin decisions use conservative revoke-wins handling.
 
@@ -76,7 +76,7 @@ Content-Type: application/json
 {"pr":7,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 ```
 
-The service validates the signed workflow context, including PR merge-commit/head binding for PR events, or trusted default-branch comment context and current human-admin authority for comment events. Neither body fields nor local payload identity establish authority. The response must be HTTP 202 with exactly:
+The service validates the signed workflow context, including PR merge-commit/head binding for PR events, or trusted default-branch workflow context for comment events. Human-admin authority is checked against live approval commands, not inferred from the trigger. Neither body fields nor local payload identity establish authority. The response must be HTTP 202 with exactly:
 
 ```json
 {
